@@ -1,0 +1,100 @@
+name: Build APK from ZIP
+
+# يفك ضغط ملف zip الموجود في المستودع ثم يبني المشروع الذي بداخله.
+# الاستخدام: ارفع ApkBuilder.zip إلى جذر المستودع + هذا الملف في .github/workflows/
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - '**.zip'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+    inputs:
+      zip_path:
+        description: 'مسار ملف zip داخل المستودع (اتركه فارغاً للبحث التلقائي)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Unzip project
+        id: unzip
+        shell: bash
+        env:
+          ZIP_INPUT: ${{ github.event.inputs.zip_path }}
+        run: |
+          set -euo pipefail
+          ZIP="${ZIP_INPUT:-}"
+          if [ -z "$ZIP" ]; then
+            ZIP=$(find . -maxdepth 2 -iname '*.zip' -not -path './.git/*' | head -n1)
+          fi
+          if [ -z "$ZIP" ] || [ ! -f "$ZIP" ]; then
+            echo "::error::لم يتم العثور على ملف zip في المستودع"
+            exit 1
+          fi
+          echo "Using: $ZIP"
+          rm -rf _project && mkdir _project
+          unzip -q "$ZIP" -d _project
+
+          # جذر المشروع = أقرب مجلد يحوي settings.gradle(.kts)
+          ROOT=$(find _project -maxdepth 4 \( -name settings.gradle -o -name settings.gradle.kts \) -printf '%h\n' \
+                 | awk '{ print length($0) " " $0 }' | sort -n | head -n1 | cut -d' ' -f2-)
+          if [ -z "$ROOT" ]; then
+            echo "::error::لا يوجد settings.gradle داخل ملف zip"
+            exit 1
+          fi
+          echo "Project root: $ROOT"
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+
+      - name: Accept Android SDK licenses
+        shell: bash
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Build debug APK
+        shell: bash
+        working-directory: ${{ steps.unzip.outputs.root }}
+        run: |
+          set -o pipefail
+          if [ -f gradlew ]; then
+            chmod +x gradlew
+            ./gradlew assembleDebug --stacktrace 2>&1 | tee build.log
+          else
+            gradle assembleDebug --stacktrace 2>&1 | tee build.log
+          fi
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: ${{ steps.unzip.outputs.root }}/**/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ${{ steps.unzip.outputs.root }}/build.log
+          if-no-files-found: ignore
