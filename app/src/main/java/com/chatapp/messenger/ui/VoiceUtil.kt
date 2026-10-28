@@ -48,14 +48,14 @@ import kotlinx.coroutines.withContext
 import java.io.File
 
 /** أقصى مدة للرسالة الصوتية (حتى يبقى حجمها صغير بوثيقة Firestore) */
-const val VOICE_MAX_MS = 120_000L
+const val VOICE_MAX_MS = 60_000L
 
 /** أقل مدة مقبولة (أقصر من هذا يعتبر ضغطة بالغلط) */
 const val VOICE_MIN_MS = 700L
 
 class VoiceResult(val b64: String, val durationMs: Long)
 
-/** تسجيل صوت AAC/m4a أحادي بجودة منخفضة (~4KB بالثانية) */
+/** تسجيل صوت AAC/m4a أحادي بجودة واضحة (~8KB بالثانية) */
 class VoiceRecorder {
     private var rec: MediaRecorder? = null
     private var file: File? = null
@@ -73,8 +73,8 @@ class VoiceRecorder {
             r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
             r.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
             r.setAudioChannels(1)
-            r.setAudioSamplingRate(16000)
-            r.setAudioEncodingBitRate(32000)
+            r.setAudioSamplingRate(44100)
+            r.setAudioEncodingBitRate(64000)
             r.setMaxDuration(VOICE_MAX_MS.toInt())
             r.setOutputFile(f.absolutePath)
             r.prepare()
