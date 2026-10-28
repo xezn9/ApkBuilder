@@ -18,6 +18,9 @@ import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.clickable
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
@@ -257,7 +260,9 @@ fun ChatScreen(other: UserItem, onBack: () -> Unit, onOpenProfile: () -> Unit = 
     val recorder = remember { VoiceRecorder() }
     var recording by remember { mutableStateOf(false) }
     var recMs by remember { mutableStateOf(0L) }
+    var cancelHint by remember { mutableStateOf(false) }
     fun finishRecording(send: Boolean) {
+        if (!recording) return
         recording = false
         if (!send) { recorder.cancel(); return }
         val r = recorder.stop()
@@ -265,7 +270,7 @@ fun ChatScreen(other: UserItem, onBack: () -> Unit, onOpenProfile: () -> Unit = 
             r == null -> Toast.makeText(ctx, "ما گدرت أسجل الصوت", Toast.LENGTH_SHORT).show()
             r.durationMs < VOICE_MIN_MS -> Toast.makeText(ctx, "التسجيل قصير", Toast.LENGTH_SHORT).show()
             else -> {
-                Repo.sendVoice(me, other.uid, r.b64, r.durationMs)
+                Repo.sendVoice(me, other.uid, r.b64, r.durationMs, r.wave)
                 scope.launch { listState.animateScrollToItem(0) }
             }
         }
@@ -276,12 +281,15 @@ fun ChatScreen(other: UserItem, onBack: () -> Unit, onOpenProfile: () -> Unit = 
         else Toast.makeText(ctx, "ما گدرت أشغّل المايك", Toast.LENGTH_SHORT).show()
     }
     val micPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
-        if (ok) beginRecording()
-        else Toast.makeText(ctx, "لازم تسمح باستخدام المايك", Toast.LENGTH_SHORT).show()
+        Toast.makeText(
+            ctx, if (ok) "اضغط مطولاً على المايك للتسجيل" else "لازم تسمح باستخدام المايك",
+            Toast.LENGTH_SHORT
+        ).show()
     }
     LaunchedEffect(recording) {
         while (recording) {
             recMs = recorder.elapsedMs()
+            recorder.sample()
             if (recMs >= VOICE_MAX_MS) { finishRecording(true); break }
             delay(100)
         }
@@ -591,10 +599,11 @@ fun ChatScreen(other: UserItem, onBack: () -> Unit, onOpenProfile: () -> Unit = 
                                 Spacer(Modifier.width(10.dp))
                                 Text(formatVoiceTime(recMs), color = fg, fontSize = 16.sp)
                                 Spacer(Modifier.weight(1f))
-                                Box(
-                                    Modifier.size(32.dp).clip(CircleShape).clickable { finishRecording(false) },
-                                    contentAlignment = Alignment.Center
-                                ) { Icon(Icons.Filled.Close, null, tint = fg.copy(alpha = 0.8f), modifier = Modifier.size(20.dp)) }
+                                Text(
+                                    if (cancelHint) "حرر للإلغاء" else "اسحب للإلغاء",
+                                    color = if (cancelHint) Color(0xFFE5484D) else fg.copy(alpha = 0.6f),
+                                    fontSize = 14.sp
+                                )
                             }
                         }
                         if (text.isEmpty() && !recording) Text("اكتب رسالة", color = fg.copy(alpha = 0.5f), fontSize = 16.sp)
@@ -608,23 +617,16 @@ fun ChatScreen(other: UserItem, onBack: () -> Unit, onOpenProfile: () -> Unit = 
                         )
                     }
                     val rtlNow = LocalLayoutDirection.current == LayoutDirection.Rtl
+                    val micMode = text.isBlank() && editing == null
+                    Box(Modifier.size(52.dp)) {
                     GlassButton(
-                        onClick = {
-                            if (recording) finishRecording(true)
-                            else if (text.isBlank() && editing == null) {
-                                if (androidx.core.content.ContextCompat.checkSelfPermission(
-                                        ctx, android.Manifest.permission.RECORD_AUDIO
-                                    ) == android.content.pm.PackageManager.PERMISSION_GRANTED
-                                ) beginRecording()
-                                else micPermission.launch(android.Manifest.permission.RECORD_AUDIO)
-                            } else submit()
-                        },
+                        onClick = { if (!micMode) submit() },
                         backdrop = contentBackdrop,
-                        tint = Blue,
+                        tint = if (recording) Color(0xFFE5484D) else Blue,
                         modifier = Modifier.size(52.dp)
                     ) {
-                      if (text.isBlank() && editing == null && !recording) {
-                        MicGlyph(Color.White, Modifier.size(24.dp))
+                      if (micMode) {
+                        MicGlyph(Color.White, Modifier.size(if (recording) 30.dp else 24.dp))
                       } else {
                         // أيقونة الإرسال تتحول لعلامة صح أثناء التعديل، وتطير عند الإرسال
                         AnimatedContent(
@@ -650,6 +652,41 @@ fun ChatScreen(other: UserItem, onBack: () -> Unit, onOpenProfile: () -> Unit = 
                             }
                         }
                       }
+                    }
+                    if (micMode) {
+                        // اضغط مطولاً للتسجيل، ارفع إصبعك للإرسال، اسحب بعيداً للإلغاء
+                        Box(
+                            Modifier.matchParentSize().pointerInput(Unit) {
+                                awaitEachGesture {
+                                    val down = awaitFirstDown(requireUnconsumed = false)
+                                    val granted = androidx.core.content.ContextCompat.checkSelfPermission(
+                                        ctx, android.Manifest.permission.RECORD_AUDIO
+                                    ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                                    if (!granted) {
+                                        micPermission.launch(android.Manifest.permission.RECORD_AUDIO)
+                                        waitForUpOrCancellation()
+                                        return@awaitEachGesture
+                                    }
+                                    beginRecording()
+                                    if (!recorder.isRecording) return@awaitEachGesture
+                                    cancelHint = false
+                                    var cancelled = false
+                                    while (true) {
+                                        val ev = awaitPointerEvent()
+                                        val ch = ev.changes.firstOrNull() ?: break
+                                        val dx = ch.position.x - down.position.x
+                                        val dy = ch.position.y - down.position.y
+                                        cancelled = kotlin.math.hypot(dx, dy) > 110.dp.toPx()
+                                        cancelHint = cancelled
+                                        if (!ch.pressed) break
+                                        ch.consume()
+                                    }
+                                    cancelHint = false
+                                    finishRecording(!cancelled)
+                                }
+                            }
+                        )
+                    }
                     }
                 }
             }
@@ -865,7 +902,7 @@ private fun BubbleBody(
                     fontSize = 15.sp, fontStyle = FontStyle.Italic
                 )
             } else if (m.audio.isNotEmpty()) {
-                VoiceBubbleContent(m.id, m.audio, m.audioMs, textColor)
+                VoiceBubbleContent(m.id, m.audio, m.audioMs, m.wave, textColor)
             } else {
                 Text(txt, color = textColor, fontSize = 16.sp)
             }

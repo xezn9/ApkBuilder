@@ -38,7 +38,9 @@ data class Msg(
     val replyFrom: String = "",
     /** رسالة صوتية: الصوت m4a بصيغة base64 (فارغ = رسالة نصية) + مدتها */
     val audio: String = "",
-    val audioMs: Long = 0L
+    val audioMs: Long = 0L,
+    /** شكل موجة الصوت (WAVE_BARS حرف a..z) */
+    val wave: String = ""
 )
 
 /**
@@ -137,7 +139,8 @@ object Repo {
         replyText = getString("replyText") ?: "",
         replyFrom = getString("replyFrom") ?: "",
         audio = getString("audio") ?: "",
-        audioMs = getLong("audioMs") ?: 0L
+        audioMs = getLong("audioMs") ?: 0L,
+        wave = getString("wave") ?: ""
     )
 
     /** الرسائل المثبتة بالمحادثة (حتى لو أقدم من آخر 50 رسالة)، الأحدث تثبيتاً أولاً */
@@ -236,7 +239,7 @@ object Repo {
 
 
     /** رسالة صوتية: الصوت base64 داخل الوثيقة (أقل من 1MB بحدود Firestore) */
-    fun sendVoice(me: String, other: String, b64: String, durationMs: Long) {
+    fun sendVoice(me: String, other: String, b64: String, durationMs: Long, wave: String = "") {
         val label = "🎤 رسالة صوتية"
         db.collection("chats").document(chatId(me, other)).set(
             mapOf(
@@ -254,6 +257,7 @@ object Repo {
                 "text" to label,
                 "audio" to b64,
                 "audioMs" to durationMs,
+                "wave" to wave,
                 "createdAt" to FieldValue.serverTimestamp()
             )
         )
