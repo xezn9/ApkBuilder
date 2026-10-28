@@ -48,14 +48,14 @@ import kotlinx.coroutines.withContext
 import java.io.File
 
 /** أقصى مدة للرسالة الصوتية (حتى يبقى حجمها صغير بوثيقة Firestore) */
-const val VOICE_MAX_MS = 60_000L
+const val VOICE_MAX_MS = 120_000L
 
 /** أقل مدة مقبولة (أقصر من هذا يعتبر ضغطة بالغلط) */
 const val VOICE_MIN_MS = 700L
 
 class VoiceResult(val b64: String, val durationMs: Long)
 
-/** تسجيل صوت AAC/m4a أحادي بجودة واضحة (~8KB بالثانية) */
+/** تسجيل صوت AMR-WB/3GP للكلام (~3KB بالثانية) */
 class VoiceRecorder {
     private var rec: MediaRecorder? = null
     private var file: File? = null
@@ -66,24 +66,27 @@ class VoiceRecorder {
 
     fun start(ctx: Context): Boolean {
         if (rec != null) return true
-        return try {
-            val f = File(ctx.cacheDir, "rec_${System.currentTimeMillis()}.m4a")
-            val r = if (Build.VERSION.SDK_INT >= 31) MediaRecorder(ctx) else @Suppress("DEPRECATION") MediaRecorder()
-            r.setAudioSource(MediaRecorder.AudioSource.MIC)
-            r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-            r.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-            r.setAudioChannels(1)
-            r.setAudioSamplingRate(44100)
-            r.setAudioEncodingBitRate(64000)
-            r.setMaxDuration(VOICE_MAX_MS.toInt())
-            r.setOutputFile(f.absolutePath)
-            r.prepare()
-            r.start()
-            rec = r; file = f; startedAt = System.currentTimeMillis()
-            true
-        } catch (e: Exception) {
-            release(); false
+        // نجرب مصدر المايك بالترتيب: VOICE_COMMUNICATION (فيه إزالة ضوضاء) ثم MIC
+        // الترميز AMR-WB (3GP): مخصص للكلام وشغال بثبات على كل الأجهزة (~3KB بالثانية)
+        val sources = intArrayOf(MediaRecorder.AudioSource.VOICE_COMMUNICATION, MediaRecorder.AudioSource.MIC)
+        for (src in sources) {
+            val f = File(ctx.cacheDir, "rec_${System.currentTimeMillis()}.3gp")
+            try {
+                val r = if (Build.VERSION.SDK_INT >= 31) MediaRecorder(ctx) else @Suppress("DEPRECATION") MediaRecorder()
+                r.setAudioSource(src)
+                r.setOutputFormat(MediaRecorder.OutputFormat.THREE_GPP)
+                r.setAudioEncoder(MediaRecorder.AudioEncoder.AMR_WB)
+                r.setMaxDuration(VOICE_MAX_MS.toInt())
+                r.setOutputFile(f.absolutePath)
+                r.prepare()
+                r.start()
+                rec = r; file = f; startedAt = System.currentTimeMillis()
+                return true
+            } catch (e: Exception) {
+                release(); f.delete()
+            }
         }
+        return false
     }
 
     /** يوقف التسجيل ويرجع الصوت كنص base64 (null إذا فشل) */
@@ -125,7 +128,7 @@ object VoicePlayer {
         if (playingId == id) { stop(); return }
         stop()
         try {
-            val f = File(ctx.cacheDir, "voice_$id.m4a")
+            val f = File(ctx.cacheDir, "voice_$id.3gp")
             withContext(Dispatchers.IO) {
                 if (!f.exists()) f.writeBytes(Base64.decode(b64, Base64.NO_WRAP))
             }
