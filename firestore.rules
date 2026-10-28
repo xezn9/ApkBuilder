@@ -1,0 +1,146 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function verified() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    // الطرف الثاني بالمحادثة (معرّف المحادثة = uid1_uid2)
+    function otherOf(chatId) {
+      return chatId.split('_')[0] == request.auth.uid ? chatId.split('_')[1] : chatId.split('_')[0];
+    }
+
+    // هل [owner] حاظر المستخدم الحالي؟
+    function blockedBy(owner) {
+      return exists(/databases/$(database)/documents/blocks/$(owner)/users/$(request.auth.uid));
+    }
+
+    // الحساب غير محظور من الإدارة (الحظر يكتبه السيرفر فقط بعد التحقق من البلاغ)
+    function notBanned() {
+      return !exists(/databases/$(database)/documents/bans/$(request.auth.uid))
+        || get(/databases/$(database)/documents/bans/$(request.auth.uid)).data.until < request.time.toMillis();
+    }
+
+    // قائمة المستخدمين: كل مفعّل يقرأ، وكل واحد يكتب ملفه بس
+    match /users/{uid} {
+      allow read: if verified();
+      allow create, update: if verified() && request.auth.uid == uid;
+    }
+
+    // الملف الشخصي والقصة: كل مفعّل يقرأ (إلا إذا صاحب الملف حاظرني)، وكل واحد يكتب ملفه بس
+    match /profiles/{uid} {
+      allow read: if verified() && (request.auth.uid == uid || !blockedBy(uid));
+      allow write: if verified() && request.auth.uid == uid;
+    }
+
+    // متصل / آخر ظهور: كل مفعّل يقرأ (إلا إذا صاحب الحالة حاظرني)، وكل واحد يكتب حالته هو بس
+    match /presence/{uid} {
+      allow read: if verified() && (request.auth.uid == uid || !blockedBy(uid));
+      allow write: if verified() && request.auth.uid == uid;
+    }
+
+    // حجز اليوزرات: كل يوزر يشير لصاحبه، ما أحد يسرق يوزر غيره
+    match /usernames/{name} {
+      allow read: if verified();
+      allow create: if verified() && request.resource.data.uid == request.auth.uid;
+      allow update: if verified() && resource.data.uid == request.auth.uid
+        && request.resource.data.uid == request.auth.uid;
+      allow delete: if verified() && resource.data.uid == request.auth.uid;
+    }
+
+    // وثيقة المحادثة (آخر رسالة + الطرفين) لقائمة المحادثات
+    match /chats/{chatId} {
+      allow read: if verified() && request.auth.uid in resource.data.participants;
+      allow create, update: if verified()
+        && request.auth.uid in chatId.split('_')
+        && request.resource.data.participants.size() == 2
+        && request.auth.uid in request.resource.data.participants
+        && notBanned()
+        && !blockedBy(otherOf(chatId));
+    }
+
+    // الرسائل: معرّف المحادثة = uid1_uid2، فقط الطرفين يقرؤون ويكتبون
+    match /chats/{chatId}/messages/{msgId} {
+      allow read: if verified() && request.auth.uid in chatId.split('_');
+      allow create: if verified()
+        && request.auth.uid in chatId.split('_')
+        && request.resource.data.from == request.auth.uid
+        && request.resource.data.text is string
+        && request.resource.data.text.size() > 0
+        && request.resource.data.text.size() <= 2000
+        && (!('audio' in request.resource.data) || (request.resource.data.audio is string && request.resource.data.audio.size() <= 700000))
+        && notBanned()
+        && !blockedBy(otherOf(chatId));
+
+      // تعديل/حذف: صاحب الرسالة فقط (النص + علامة تعديل + علامة حذف + التثبيت)
+      // تثبيت/إلغاء تثبيت: أي طرف من المحادثة (يتغير فقط حقول التثبيت)
+      allow update: if verified()
+        && request.auth.uid in chatId.split('_')
+        && notBanned()
+        && !blockedBy(otherOf(chatId))
+        && (
+          (
+            resource.data.from == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly(['text', 'edited', 'deleted', 'pinned', 'audio', 'audioMs'])
+            && request.resource.data.text is string
+            && request.resource.data.text.size() <= 2000
+            && (request.resource.data.deleted == true || request.resource.data.text.size() > 0)
+          )
+          || (
+            request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['pinned', 'pinnedAt', 'pinnedBy'])
+          )
+        );
+    }
+
+    // الحظر: صاحب القائمة يكتب ويقرأ، والمحظور يگدر يقرأ سجله هو بس (get) حتى يعرف أنه محظور
+    match /blocks/{owner}/users/{target} {
+      allow get: if verified() && (request.auth.uid == owner || request.auth.uid == target);
+      allow list: if verified() && request.auth.uid == owner;
+      allow create, update, delete: if verified() && request.auth.uid == owner && owner != target;
+    }
+
+    // إعدادات خاصة بالمستخدم (المثبتين)
+    match /settings/{uid} {
+      allow read, write: if verified() && request.auth.uid == uid;
+    }
+
+    // توكنات الإشعارات: المستخدم يكتب توكنات أجهزته، والسيرفر فقط يقرأها
+    match /tokens/{uid}/devices/{token} {
+      allow create, update, delete: if verified() && request.auth.uid == uid;
+    }
+
+    // البلاغات: أي مفعّل يرسل بلاغ، والسيرفر (Cloud Function) هو الوحيد الي يقرأ ويقرر
+    match /reports/{id} {
+      allow create: if verified()
+        && request.resource.data.keys().hasOnly(['reporter', 'reported', 'chatId', 'reason', 'messageIds', 'status', 'createdAt'])
+        && request.resource.data.reporter == request.auth.uid
+        && request.resource.data.reported != request.auth.uid
+        && request.resource.data.status == 'new'
+        && request.resource.data.reason in ['abuse', 'violence', 'suicide_kill']
+        && request.resource.data.messageIds is list
+        && request.resource.data.messageIds.size() <= 15
+        && request.resource.data.chatId == (request.auth.uid < request.resource.data.reported
+            ? request.auth.uid + '_' + request.resource.data.reported
+            : request.resource.data.reported + '_' + request.auth.uid);
+    }
+
+    // حظر الحساب: المستخدم يقرأ حظره هو بس، والكتابة من السيرفر فقط
+    match /bans/{uid} {
+      allow read: if verified() && request.auth.uid == uid;
+    }
+
+    // إعدادات التطبيق العامة (رقم آخر نسخة + رابط التحديث): الكل يقرأ حتى قبل تسجيل الدخول، والكتابة من Firebase Console فقط
+    match /app_config/{doc} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // سجل المخالفات (عدد المرات): للسيرفر فقط، ما أحد يقرأه ولا يكتبه من التطبيق
+    match /moderation/{uid} {
+      allow read, write: if false;
+    }
+  }
+}
