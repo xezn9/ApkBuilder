@@ -63,7 +63,8 @@ jobs:
       - name: Show error details
         if: failure()
         working-directory: ${{ env.PROJECT_DIR }}
-        run: grep -n -B1 -A6 -E "Dependency|requires|issues were found|error:|e: " build.log | head -150 || true
+        run: |
+          grep -n -B1 -A6 -E "Dependency|requires|issues were found|error:|e: " build.log | head -150 || true
 
       - name: Collect APK
         run: |
