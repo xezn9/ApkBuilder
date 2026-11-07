@@ -259,7 +259,15 @@ object ProjectDetector {
 
         fun javaStep() = step("إعداد Java ${info.jdk}", "actions/setup-java@v4",
             listOf("distribution" to "temurin", "java-version" to info.jdk))
-        fun sdkStep() = step("إعداد Android SDK", "android-actions/setup-android@v3")
+        // نكتب تراخيص الـ SDK يدوياً بدل android-actions/setup-android (كان يفشل بـ sdkmanager exit code 1)
+        fun sdkStep() = step("تجهيز Android SDK", run = listOf(
+            "SDK=\"\${ANDROID_HOME:-\${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}\"",
+            "LIC='\\n24333f8a63b6825ea9c5514f83c2829b004d1fee\\n8933bad161af4178b1185d1a37fbf41ea5269c55\\nd56f5187479451eabf01fb78af6dfcb131a6481e\\n'",
+            "sudo mkdir -p \"\$SDK/licenses\"",
+            "printf \"\$LIC\" | sudo tee \"\$SDK/licenses/android-sdk-license\" > /dev/null",
+            "echo \"ANDROID_HOME=\$SDK\" >> \"\$GITHUB_ENV\"",
+            "echo \"ANDROID_SDK_ROOT=\$SDK\" >> \"\$GITHUB_ENV\""
+        ).joinToString("\n"))
         fun nodeStep() = step("إعداد Node ${info.node}", "actions/setup-node@v4", listOf("node-version" to info.node))
         fun uploadStep(path: String) = step("رفع ملف APK", "actions/upload-artifact@v4",
             listOf("name" to "apk", "path" to path, "if-no-files-found" to "error"))

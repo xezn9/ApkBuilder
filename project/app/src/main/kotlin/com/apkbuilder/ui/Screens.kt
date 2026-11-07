@@ -83,6 +83,9 @@ import com.apkbuilder.engine.Phase
 import com.apkbuilder.settings.AppSettings
 import com.apkbuilder.settings.SaveMode
 import com.kyant.backdrop.Backdrop
+import com.kyant.backdrop.backdrops.rememberLayerBackdrop
+import com.kyant.backdrop.backdrops.rememberCombinedBackdrop
+import com.kyant.backdrop.backdrops.layerBackdrop
 
 private enum class LogView { ERRORS, FULL }
 
@@ -117,17 +120,22 @@ fun AppRoot(
 
     CompositionLocalProvider(LocalAccent provides accent) {
         GlassScene(accent) { backdrop ->
+            // طبقة المحتوى (البطاقات والنصوص) تُسجَّل ليراها الشريط السفلي من خلف الزجاج
+            val contentBackdrop = rememberLayerBackdrop()
+            val barBackdrop = rememberCombinedBackdrop(backdrop, contentBackdrop)
             Box(Modifier.fillMaxSize()) {
-                when (tab) {
-                    0 -> BuildScreen(vm, backdrop, pickProject)
-                    1 -> LogScreen(vm, backdrop)
-                    else -> SettingsScreen(vm, st, backdrop, pickFolder)
+                Box(Modifier.fillMaxSize().layerBackdrop(contentBackdrop)) {
+                    when (tab) {
+                        0 -> BuildScreen(vm, backdrop, pickProject)
+                        1 -> LogScreen(vm, backdrop)
+                        else -> SettingsScreen(vm, st, backdrop, pickFolder)
+                    }
                 }
 
                 LiquidBottomTabs(
                     selectedTabIndex = { tab },
                     onTabSelected = { tab = it },
-                    backdrop = backdrop,
+                    backdrop = barBackdrop,
                     tabsCount = 3,
                     containerColor = barColor.copy(alpha = (1f - st.transparency).coerceIn(0.02f, 1f)),
                     accentColor = accent,
