@@ -50,6 +50,7 @@ import com.kyant.backdrop.drawBackdrop
 import com.kyant.backdrop.effects.blur
 import com.kyant.backdrop.effects.lens
 import com.kyant.backdrop.effects.vibrancy
+import com.kyant.backdrop.shadow.InnerShadow
 
 /**
  * تأثير Liquid Glass الأصلي من مكتبة backdrop (io.github.kyant0:backdrop).
@@ -57,11 +58,11 @@ import com.kyant.backdrop.effects.vibrancy
  */
 fun Modifier.liquidGlass(
     backdrop: Backdrop,
-    radius: Dp = 28.dp,
+    radius: Dp = 32.dp,
     tint: Color = Color.White.copy(alpha = 0.10f),
-    blurRadius: Dp = 6.dp,
+    blurRadius: Dp = 8.dp,
     refraction: Boolean = false,
-    vibrant: Boolean = false
+    vibrant: Boolean = true
 ): Modifier = this.drawBackdrop(
     backdrop = backdrop,
     shape = { RoundedCornerShape(radius) },
@@ -70,7 +71,19 @@ fun Modifier.liquidGlass(
         blur(blurRadius.toPx())
         if (refraction) lens(14.dp.toPx(), 28.dp.toPx())
     },
-    onDrawSurface = { drawRect(tint) }
+    // ظل داخلي خفيف يعطي سماكة الزجاج
+    innerShadow = { InnerShadow(radius = 6.dp, alpha = 0.22f) },
+    // لمعة متدرجة: أفتح من الأعلى وأخف من الأسفل
+    onDrawSurface = {
+        drawRect(
+            Brush.verticalGradient(
+                listOf(
+                    tint.copy(alpha = (tint.alpha * 1.6f).coerceAtMost(1f)),
+                    tint.copy(alpha = tint.alpha * 0.6f)
+                )
+            )
+        )
+    }
 )
 
 /** يدوّر درجة اللون (Hue) للحصول على ألوان متناسقة مع لون التطبيق. */
@@ -88,8 +101,16 @@ fun GlassScene(
     content: @Composable BoxScope.(backdrop: LayerBackdrop) -> Unit
 ) {
     val backdrop = rememberLayerBackdrop()
-    val a = 0.35f
-    val b = 0.6f
+    // البقع الملونة تتحرك ببطء — الزجاج يعكسها فتبدو الواجهة حيّة
+    val t = rememberInfiniteTransition(label = "scene")
+    val a by t.animateFloat(
+        0.1f, 0.9f,
+        infiniteRepeatable(tween(16000, easing = LinearEasing), RepeatMode.Reverse), label = "a"
+    )
+    val b by t.animateFloat(
+        0.9f, 0.1f,
+        infiniteRepeatable(tween(22000, easing = LinearEasing), RepeatMode.Reverse), label = "b"
+    )
 
     Box(Modifier.fillMaxSize().background(Color(0xFF070B18))) {
         Canvas(Modifier.fillMaxSize().layerBackdrop(backdrop)) {
@@ -112,14 +133,14 @@ fun GlassScene(
 fun GlassCard(
     backdrop: Backdrop,
     modifier: Modifier = Modifier,
-    radius: Dp = 28.dp,
+    radius: Dp = 32.dp,
     tint: Color = Color.White.copy(alpha = 0.08f),
     content: @Composable ColumnScope.() -> Unit
 ) {
     Column(
         modifier = modifier
-            .liquidGlass(backdrop, radius, tint)
-            .padding(18.dp),
+            .liquidGlass(backdrop, radius, tint, refraction = true)
+            .padding(20.dp),
         content = content
     )
 }

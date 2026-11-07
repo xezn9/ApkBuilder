@@ -182,9 +182,17 @@ private fun BuildScreen(
             .padding(top = 20.dp, bottom = 130.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        Column {
-            Text("ApkBuilder", color = Color.White, fontSize = 34.sp, fontWeight = FontWeight.Bold)
-            Text("البناء يتم على GitHub Actions ويرجع لك الـ APK", color = Color.White.copy(alpha = 0.7f), fontSize = 14.sp)
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+            Box(
+                Modifier.size(60.dp).liquidGlass(backdrop, 30.dp, accent.copy(alpha = 0.35f), refraction = true),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(Icons.Filled.Build, null, tint = Color.White, modifier = Modifier.size(30.dp))
+            }
+            Column {
+                Text("ApkBuilder", color = Color.White, fontSize = 32.sp, fontWeight = FontWeight.Bold)
+                Text("ابنِ مشروعك على GitHub وخذ الـ APK", color = Color.White.copy(alpha = 0.7f), fontSize = 14.sp)
+            }
         }
 
         GitHubCard(vm, backdrop)
@@ -208,11 +216,15 @@ private fun BuildScreen(
         }
 
         if (vm.isRunning) {
-            GlassButton(backdrop, "إيقاف البناء", Icons.Filled.Stop, vm::cancel, Modifier.fillMaxWidth(), accent = Bad)
+            GlassButton(
+                backdrop, "إيقاف البناء", Icons.Filled.Stop, vm::cancel, Modifier.fillMaxWidth(), accent = Bad,
+                radius = 36.dp, contentPadding = PaddingValues(horizontal = 24.dp, vertical = 20.dp)
+            )
         } else {
             GlassButton(
                 backdrop, "ابدأ البناء", Icons.Filled.PlayArrow, vm::start, Modifier.fillMaxWidth(),
-                accent = accent, enabled = canStart
+                accent = accent, enabled = canStart,
+                radius = 36.dp, contentPadding = PaddingValues(horizontal = 24.dp, vertical = 20.dp)
             )
         }
 
