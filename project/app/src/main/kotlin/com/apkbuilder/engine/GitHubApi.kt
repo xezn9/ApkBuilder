@@ -9,6 +9,7 @@ import java.net.HttpURLConnection
 import java.net.ProtocolException
 import java.net.URL
 import java.net.URLEncoder
+import java.security.MessageDigest
 import java.nio.ByteBuffer
 import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
@@ -17,7 +18,13 @@ import java.nio.charset.CodingErrorAction
  * @param code رمز HTTP (0 = مشكلة اتصال).
  * @param retryAfterMs إن كان > 0 فالخطأ مؤقت (ضغط على الخادم أو حد المعدل) ويمكن إعادة المحاولة بعد هذه المدة.
  */
-class GitHubException(val code: Int, message: String, val retryAfterMs: Long = 0L) : Exception(message)
+class GitHubException(val code: Int, message: String, val retryAfterMs: Long = 0L) : Exception(message) {
+    /** خطأ مؤقت (ضغط/عطل في GitHub أو حد المعدل) — يستحق الانتظار وإعادة المحاولة بدل الفشل. */
+    val isTransient: Boolean get() = code >= 500 || code == 429 || retryAfterMs != 0L
+}
+
+/** انقطاع الاتصال بالإنترنت (وليس خطأً من GitHub). */
+class NetworkException(message: String) : IOException(message)
 
 /** عميل GitHub REST API بدون أي مكتبات خارجية (HttpURLConnection + org.json). */
 class GitHubApi(private val token: String) {
@@ -109,7 +116,7 @@ class GitHubApi(private val token: String) {
                 if (e.retryAfterMs <= 0L || attempt >= retries) throw e
                 Thread.sleep(e.retryAfterMs)
             } catch (e: IOException) {
-                if (attempt >= retries) throw GitHubException(0, "تعذر الاتصال بـ GitHub — تحقق من الإنترنت")
+                if (attempt >= retries) throw NetworkException("تعذر الاتصال بـ GitHub — تحقق من الإنترنت")
                 Thread.sleep(1500L * attempt)
             }
         }
@@ -132,7 +139,7 @@ class GitHubApi(private val token: String) {
                 val scopes = c.getHeaderField("X-OAuth-Scopes")?.split(',')?.map { it.trim() }?.filter { it.isNotEmpty() }
                 return JSONObject(text).getString("login") to scopes
             } catch (e: IOException) {
-                if (attempt >= 3) throw GitHubException(0, "تعذر الاتصال بـ GitHub — تحقق من الإنترنت")
+                if (attempt >= 3) throw NetworkException("تعذر الاتصال بـ GitHub — تحقق من الإنترنت")
                 Thread.sleep(1500L * attempt)
             } finally {
                 c.disconnect()
@@ -171,7 +178,7 @@ class GitHubApi(private val token: String) {
     /** مسارات كل الملفات في الفرع (قد تُقتطع في المستودعات الضخمة جداً). */
     fun tree(repo: String, branch: String): List<String> {
         val res = JSONObject(call("GET", "/repos/$repo/git/trees/${encRef(branch)}?recursive=1"))
-        if (res.optBoolean("truncated")) throw GitHubException(0, "المستودع كبير جداً للفحص التلقائي — اختر ملف zip للمشروع")
+        if (res.optBoolean("truncated")) throw GitHubException(-1, "المستودع كبير جداً للفحص التلقائي — اختر ملف zip للمشروع")
         val arr = res.getJSONArray("tree")
         val out = ArrayList<String>()
         for (i in 0 until arr.length()) {
@@ -185,7 +192,8 @@ class GitHubApi(private val token: String) {
     fun readText(repo: String, path: String, ref: String): String? = try {
         val o = JSONObject(call("GET", "/repos/$repo/contents/${path.split('/').joinToString("/") { enc(it) }}?ref=${enc(ref)}"))
         String(Base64.decode(o.getString("content"), Base64.DEFAULT), Charsets.UTF_8)
-    } catch (_: Exception) {
+    } catch (e: Exception) {
+        if (e is IOException || (e is GitHubException && e.isTransient)) throw e
         null
     }
 
@@ -210,21 +218,44 @@ class GitHubApi(private val token: String) {
         JSONObject(call("POST", "/repos/$repo/git/trees", JSONObject().put("base_tree", base).put("tree", entries)))
             .getString("sha")
 
+    private fun fingerprint(files: Map<String, ByteArray>, replaceDir: String?): String {
+        val md = MessageDigest.getInstance("SHA-256")
+        md.update((replaceDir ?: "").toByteArray())
+        for ((path, data) in files) {
+            md.update(path.toByteArray()); md.update(0.toByte())
+            md.update(data.size.toString().toByteArray()); md.update(10.toByte())
+        }
+        return md.digest().joinToString("") { "%02x".format(it) }
+    }
+
     /**
      * يرفع الملفات في commit واحد (Git Data API) ويعيد sha الخاص به.
      * الملفات النصية تُرسل داخل الـ tree مباشرة (طلب واحد لكل دفعة)، والثنائية فقط تحتاج blob مستقل.
+     *
+     * الاستئناف: بعد كل دفعة يُستدعى [onCheckpoint] بنقطة تحتوي آخر tree أُنشئ على GitHub وفهرس الملف التالي.
+     * إن انقطع الاتصال ثم استُدعيت الدالة من جديد بنفس [resume] (والملفات نفسها) تكمل من تلك النقطة
+     * ولا تعيد رفع ما تم رفعه.
      * @param replaceDir إن حُدد، تُحذف منه أي ملفات قديمة غير موجودة في [files].
      */
     fun commitFiles(
         repo: String, branch: String, files: Map<String, ByteArray>, message: String,
-        replaceDir: String? = null, onProgress: (String) -> Unit = {}
+        replaceDir: String? = null, onProgress: (String) -> Unit = {},
+        resume: UploadCheckpoint? = null, onCheckpoint: (UploadCheckpoint?) -> Unit = {}
     ): String {
+        val fp = fingerprint(files, replaceDir)
+        var cp = resume?.takeIf { it.fingerprint == fp }
         var attempt = 0
         while (true) {
             attempt++
             try {
-                return commitOnce(repo, branch, files, message, replaceDir, onProgress)
+                return commitOnce(repo, branch, files, message, replaceDir, onProgress, fp, cp, onCheckpoint)
             } catch (e: GitHubException) {
+                if (cp != null && (e.code == 404 || e.code == 409 || e.code == 422)) {
+                    // الكائنات المحفوظة لم تعد صالحة (حُذفت أو تغيّر الفرع) → نبدأ الرفع من جديد
+                    cp = null; onCheckpoint(null)
+                    onProgress("تعذر الإكمال من نقطة التوقف — إعادة الرفع من البداية…")
+                    continue
+                }
                 // شخص/عملية دفعت للفرع أثناء رفعنا → نعيد من أحدث commit
                 val conflict = e.code == 409 || (e.code == 422 && attempt < 3)
                 if (!conflict || attempt >= 3) throw e
@@ -258,36 +289,60 @@ class GitHubApi(private val token: String) {
 
     private fun commitOnce(
         repo: String, branch: String, files: Map<String, ByteArray>, message: String,
-        replaceDir: String?, onProgress: (String) -> Unit
+        replaceDir: String?, onProgress: (String) -> Unit,
+        fp: String, resume: UploadCheckpoint?, onCheckpoint: (UploadCheckpoint?) -> Unit
     ): String {
-        val parentSha = headSha(repo, branch)
-        val baseTree = JSONObject(call("GET", "/repos/$repo/git/commits/$parentSha"))
-            .getJSONObject("tree").getString("sha")
+        val head = headSha(repo, branch)
+        val refPath = "/repos/$repo/git/refs/heads/${encRef(branch)}"
+        val entries = files.entries.toList()
 
-        var current = baseTree
-        var batch = JSONArray()
-        var batchBytes = 0
-        var done = 0
-
-        fun flush() {
-            if (batch.length() == 0) return
-            current = createTree(repo, current, batch)
-            batch = JSONArray(); batchBytes = 0
-        }
-
-        // حذف الملفات القديمة داخل المجلد المستبدَل
-        if (replaceDir != null) {
-            val old = JSONObject(call("GET", "/repos/$repo/git/trees/$baseTree?recursive=1")).getJSONArray("tree")
-            for (i in 0 until old.length()) {
-                val e = old.getJSONObject(i)
-                val path = e.getString("path")
-                if (e.optString("type") == "blob" && path.startsWith("$replaceDir/") && !files.containsKey(path)) {
-                    batch.put(JSONObject().put("path", path).put("mode", "100644").put("type", "blob").put("sha", JSONObject.NULL))
-                }
+        // الـ commit أُنشئ في محاولة سابقة: نتأكد أن الفرع وصل إليه أو نحرّكه الآن
+        if (resume?.commitSha != null) {
+            if (head == resume.commitSha) return resume.commitSha
+            if (head == resume.parentSha) {
+                call("PATCH", refPath, JSONObject().put("sha", resume.commitSha))
+                return resume.commitSha
             }
         }
 
-        for ((path, data) in files) {
+        val parentSha = head
+        var current: String
+        var startIndex = 0
+        if (resume != null && resume.parentSha == head && resume.commitSha == null) {
+            current = resume.currentTree; startIndex = resume.nextIndex.coerceIn(0, entries.size)
+            onProgress("استئناف الرفع من الملف $startIndex / ${entries.size}…")
+        } else {
+            val baseTree = JSONObject(call("GET", "/repos/$repo/git/commits/$parentSha"))
+                .getJSONObject("tree").getString("sha")
+            current = baseTree
+            // حذف الملفات القديمة داخل المجلد المستبدَل
+            if (replaceDir != null) {
+                val old = JSONObject(call("GET", "/repos/$repo/git/trees/$baseTree?recursive=1")).getJSONArray("tree")
+                val deletions = JSONArray()
+                for (i in 0 until old.length()) {
+                    val e = old.getJSONObject(i)
+                    val path = e.getString("path")
+                    if (e.optString("type") == "blob" && path.startsWith("$replaceDir/") && !files.containsKey(path)) {
+                        deletions.put(JSONObject().put("path", path).put("mode", "100644").put("type", "blob").put("sha", JSONObject.NULL))
+                    }
+                }
+                if (deletions.length() > 0) current = createTree(repo, current, deletions)
+            }
+            onCheckpoint(UploadCheckpoint(fp, parentSha, current, 0))
+        }
+
+        var batch = JSONArray()
+        var batchBytes = 0
+
+        fun flush(nextIndex: Int) {
+            if (batch.length() == 0) return
+            current = createTree(repo, current, batch)
+            batch = JSONArray(); batchBytes = 0
+            onCheckpoint(UploadCheckpoint(fp, parentSha, current, nextIndex))
+        }
+
+        for (i in startIndex until entries.size) {
+            val (path, data) = entries[i]
             val mode = if (path.endsWith("gradlew") || path.endsWith(".sh")) "100755" else "100644"
             val entry = JSONObject().put("path", path).put("mode", mode).put("type", "blob")
             val text = asText(data)
@@ -299,12 +354,11 @@ class GitHubApi(private val token: String) {
             }
             batch.put(entry)
             batchBytes += data.size
-            done++
             if (batchBytes > 2_000_000 || batch.length() >= 400) {
-                flush(); onProgress("رفع الملفات… $done / ${files.size}")
+                flush(i + 1); onProgress("رفع الملفات… ${i + 1} / ${entries.size}")
             }
         }
-        flush()
+        flush(entries.size)
 
         val commit = JSONObject(
             call(
@@ -312,7 +366,9 @@ class GitHubApi(private val token: String) {
                 JSONObject().put("message", message).put("tree", current).put("parents", JSONArray().put(parentSha))
             )
         ).getString("sha")
-        call("PATCH", "/repos/$repo/git/refs/heads/${encRef(branch)}", JSONObject().put("sha", commit))
+        // نحفظ الـ commit قبل تحريك الفرع: لو انقطع الاتصال بعد وصول الطلب نتحقق ولا نكرر العمل
+        onCheckpoint(UploadCheckpoint(fp, parentSha, current, entries.size, commit))
+        call("PATCH", refPath, JSONObject().put("sha", commit))
         return commit
     }
 
@@ -383,27 +439,34 @@ class GitHubApi(private val token: String) {
     fun downloadLogs(repo: String, runId: Long, dest: File) =
         download("$base/repos/$repo/actions/runs/$runId/logs", dest)
 
-    /** GitHub يرد بتحويل (302) إلى رابط مؤقت — لا نرسل التوكن إلى الرابط الثاني. */
+    /**
+     * GitHub يرد بتحويل (302) إلى رابط مؤقت — لا نرسل التوكن إلى الرابط الثاني.
+     * التنزيل قابل للاستئناف: ما نُزّل يُحفظ في `<dest>.part` ويُكمَل بطلب Range عند إعادة المحاولة،
+     * حتى بعد انقطاع طويل أو إعادة تشغيل التطبيق.
+     */
     private fun download(url: String, dest: File) {
+        val part = File(dest.path + ".part")
         var attempt = 0
         while (true) {
             attempt++
             try {
-                downloadOnce(url, dest)
+                downloadOnce(url, dest, part)
                 return
             } catch (e: GitHubException) {
-                dest.delete()
-                if (attempt >= 3 || (e.code < 500 && e.retryAfterMs <= 0L)) throw e
+                if (attempt >= 3 || (e.code < 500 && e.retryAfterMs <= 0L)) {
+                    if (!e.isTransient) part.delete()
+                    throw e
+                }
                 Thread.sleep(2000L * attempt)
             } catch (e: IOException) {
-                dest.delete()
-                if (attempt >= 3) throw GitHubException(0, "انقطع التنزيل — تحقق من الإنترنت")
+                // نُبقي الملف الجزئي ليُستأنف
+                if (attempt >= 3) throw NetworkException("انقطع التنزيل — تحقق من الإنترنت")
                 Thread.sleep(2000L * attempt)
             }
         }
     }
 
-    private fun downloadOnce(url: String, dest: File) {
+    private fun downloadOnce(url: String, dest: File, part: File) {
         dest.parentFile?.mkdirs()
         val first = open(url, "GET", false)
         first.instanceFollowRedirects = false
@@ -414,14 +477,21 @@ class GitHubApi(private val token: String) {
                 val second = URL(loc).openConnection() as HttpURLConnection
                 second.connectTimeout = 20_000
                 second.readTimeout = 120_000
+                val have = if (part.exists()) part.length() else 0L
+                if (have > 0) second.setRequestProperty("Range", "bytes=$have-")
                 try {
-                    if (second.responseCode !in 200..299) throw GitHubException(second.responseCode, "فشل التنزيل (${second.responseCode})")
-                    second.inputStream.use { i -> dest.outputStream().use { o -> i.copyTo(o) } }
+                    val c2 = second.responseCode
+                    when (c2) {
+                        206 -> saveBody(second, part, append = true, already = have)
+                        in 200..299 -> saveBody(second, part, append = false, already = 0L)
+                        416 -> { part.delete(); throw IOException("الملف الجزئي غير صالح — إعادة التنزيل") }
+                        else -> throw GitHubException(c2, "فشل التنزيل ($c2)")
+                    }
                 } finally {
                     second.disconnect()
                 }
             } else if (code in 200..299) {
-                first.inputStream.use { i -> dest.outputStream().use { o -> i.copyTo(o) } }
+                saveBody(first, part, append = false, already = 0L)
             } else {
                 val text = first.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
                 throw GitHubException(code, friendly(code, text))
@@ -429,5 +499,13 @@ class GitHubApi(private val token: String) {
         } finally {
             first.disconnect()
         }
+        dest.delete()
+        if (!part.renameTo(dest)) { part.copyTo(dest, overwrite = true); part.delete() }
+    }
+
+    private fun saveBody(c: HttpURLConnection, part: File, append: Boolean, already: Long) {
+        val expected = c.contentLengthLong.takeIf { it >= 0 }?.let { it + already }
+        java.io.FileOutputStream(part, append).use { o -> c.inputStream.use { i -> i.copyTo(o) } }
+        if (expected != null && part.length() != expected) throw IOException("انقطع التنزيل قبل اكتماله")
     }
 }

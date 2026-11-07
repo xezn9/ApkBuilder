@@ -42,7 +42,7 @@ import kotlinx.coroutines.delay
 
 /** مؤشر انتظار أثناء البناء: حلقتان متدرجتان + نواة تنبض + مراحل + مؤقت. */
 @Composable
-fun BuildLoader(phase: Phase, status: String, startedAt: Long, modifier: Modifier = Modifier) {
+fun BuildLoader(phase: Phase, status: String, startedAt: Long, modifier: Modifier = Modifier, paused: Boolean = false) {
     val accent = LocalAccent.current
     val t = rememberInfiniteTransition(label = "loader")
     val rot by t.animateFloat(0f, 360f, infiniteRepeatable(tween(2000, easing = LinearEasing)), label = "r1")
@@ -94,7 +94,10 @@ fun BuildLoader(phase: Phase, status: String, startedAt: Long, modifier: Modifie
             color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold,
             modifier = Modifier.padding(vertical = 8.dp)
         )
-        Text(status, color = Color.White.copy(alpha = 0.85f), fontSize = 14.sp)
+        Text(
+            if (paused) "⏸ $status" else status,
+            color = if (paused) Color(0xFFFFB84D) else Color.White.copy(alpha = 0.85f), fontSize = 14.sp
+        )
 
         val index = when (phase) { Phase.UPLOADING -> 0; Phase.QUEUED -> 1; Phase.BUILDING -> 2; else -> 3 }
         Row(
@@ -120,7 +123,8 @@ fun BuildLoader(phase: Phase, status: String, startedAt: Long, modifier: Modifie
             }
         }
         Text(
-            "البناء على GitHub قد يستغرق عدة دقائق — أبقِ التطبيق مفتوحاً",
+            if (paused) "تقدّمك محفوظ — يكمل التطبيق تلقائياً من نفس النقطة عند عودة الإنترنت"
+            else "البناء على GitHub قد يستغرق عدة دقائق — إن انقطع الإنترنت يكمل التطبيق من نفس النقطة",
             color = Color.White.copy(alpha = 0.55f), fontSize = 11.sp
         )
     }

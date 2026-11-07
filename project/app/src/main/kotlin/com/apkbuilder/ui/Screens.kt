@@ -40,6 +40,7 @@ import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.LinkOff
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
@@ -221,8 +222,14 @@ private fun BuildScreen(
                 radius = 36.dp, contentPadding = PaddingValues(horizontal = 24.dp, vertical = 20.dp)
             )
         } else {
+            vm.resumable?.let { saved ->
+                GlassButton(
+                    backdrop, "استئناف من «${saved.stage.label}»", Icons.Filled.Refresh, vm::resume, Modifier.fillMaxWidth(),
+                    accent = Ok, radius = 36.dp, contentPadding = PaddingValues(horizontal = 24.dp, vertical = 20.dp)
+                )
+            }
             GlassButton(
-                backdrop, "ابدأ البناء", Icons.Filled.PlayArrow, vm::start, Modifier.fillMaxWidth(),
+                backdrop, if (vm.resumable != null) "بناء جديد من البداية" else "ابدأ البناء", Icons.Filled.PlayArrow, vm::start, Modifier.fillMaxWidth(),
                 accent = accent, enabled = canStart,
                 radius = 36.dp, contentPadding = PaddingValues(horizontal = 24.dp, vertical = 20.dp)
             )
@@ -380,7 +387,7 @@ private fun StatusCard(vm: BuildViewModel, backdrop: Backdrop) {
     if (vm.isRunning) {
         // أثناء العمل: بطاقة بدون backdrop حتى لا تُعاد معالجة الزجاج مع كل إطار من الأنيميشن
         PlainCard(Modifier.fillMaxWidth(), radius = 28.dp, tint = accent.copy(alpha = 0.16f)) {
-            BuildLoader(vm.phase, vm.statusText, vm.startedAt)
+            BuildLoader(if (vm.phase == Phase.PAUSED) vm.pausedFrom else vm.phase, vm.statusText, vm.startedAt, paused = vm.phase == Phase.PAUSED)
             if (vm.errors.isNotEmpty()) {
                 Text(
                     "${vm.errors.size} خطأ حتى الآن — تبويب «السجل»",

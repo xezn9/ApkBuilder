@@ -22,6 +22,11 @@ import com.apkbuilder.engine.GitHubApi
 import com.apkbuilder.engine.GitHubException
 import com.apkbuilder.engine.LogLevel
 import com.apkbuilder.engine.LogLine
+import com.apkbuilder.engine.BuildSession
+import com.apkbuilder.engine.NetworkException
+import com.apkbuilder.engine.NetworkMonitor
+import com.apkbuilder.engine.SessionStore
+import com.apkbuilder.engine.Stage
 import com.apkbuilder.engine.ProjectDetector
 import com.apkbuilder.engine.ProjectInfo
 import com.apkbuilder.engine.UnsupportedProjectException
@@ -36,6 +41,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.IOException
 import java.util.zip.ZipInputStream
 
 class BuildViewModel(private val app: Application) : AndroidViewModel(app) {
@@ -74,14 +80,34 @@ class BuildViewModel(private val app: Application) : AndroidViewModel(app) {
 
     private var job: Job? = null
 
+    // ----------------------------------------------------------- الاستئناف بعد الانقطاع
+    private val store = SessionStore(app)
+    private val net = NetworkMonitor(app)
+    private var session: BuildSession? = null
+    private var userCancelled = false
+
+    /** المرحلة التي كان البناء فيها قبل التوقف المؤقت (لعرضها في المؤشر). */
+    var pausedFrom by mutableStateOf(Phase.UPLOADING); private set
+
+    /** بناء غير مكتمل محفوظ يمكن استئنافه (يظهر زر «استئناف» عندما لا يكون هناك بناء جارٍ). */
+    var resumable by mutableStateOf<BuildSession?>(null); private set
+
     val isRunning: Boolean
         get() = phase == Phase.UPLOADING || phase == Phase.QUEUED ||
-            phase == Phase.BUILDING || phase == Phase.DOWNLOADING
+            phase == Phase.BUILDING || phase == Phase.DOWNLOADING || phase == Phase.PAUSED
 
     val isConnected: Boolean get() = settings.token.isNotBlank() && login != null
 
     init {
         if (settings.token.isNotBlank()) refreshAccount()
+        // بناء كان جارياً عند إغلاق التطبيق/انقطاع النت → نكمله تلقائياً من آخر مرحلة
+        val saved = store.load()
+        if (saved != null && settings.token.isNotBlank() && saved.repo == settings.repo) {
+            resumable = saved
+            resume()
+        } else if (saved != null) {
+            discardSession(saved)
+        }
     }
 
     // ============================================================ ربط حساب GitHub
@@ -208,150 +234,343 @@ class BuildViewModel(private val app: Application) : AndroidViewModel(app) {
     private fun log(level: LogLevel, text: String) { logs.add(LogLine(level, text)) }
     private fun status(text: String) { statusText = text }
 
-    fun start() {
-        val s = settings
-        if (isRunning || detecting || s.token.isBlank() || s.repo.isBlank()) return
-        logs.clear(); errors.clear(); askQueue.clear(); targetNames.clear()
-        savedApks = emptyList(); runUrl = null
-        startedAt = System.currentTimeMillis()
-        val repo = s.repo
-        var wfId = 0L
-        var runId = 0L
-        val api = GitHubApi(s.token)
+    private fun phaseFor(st: Stage) = when (st) {
+        Stage.UPLOAD, Stage.WAIT_WORKFLOW -> Phase.UPLOADING
+        Stage.DISPATCH, Stage.FIND_RUN -> Phase.QUEUED
+        Stage.POLL -> Phase.BUILDING
+        else -> Phase.DOWNLOADING
+    }
 
-        job = viewModelScope.launch(Dispatchers.IO) {
+    private val sessionZip: File get() = File(app.filesDir, "session/project.zip")
+
+    private fun discardSession(s: BuildSession? = session) {
+        store.clear(); session = null; resumable = null
+        runCatching { sessionZip.delete() }
+        s?.runId?.takeIf { it != 0L }?.let { id ->
+            runCatching { File(app.cacheDir, "run_logs_$id.zip.part").delete(); File(app.cacheDir, "run_logs_$id.zip").delete() }
+        }
+    }
+
+    /** يحفظ تعديلاً على الجلسة على القرص فوراً. */
+    private fun patch(block: BuildSession.() -> BuildSession) {
+        val ns = session!!.block(); session = ns; store.save(ns)
+    }
+
+    private fun setStage(st: Stage) {
+        patch { copy(stage = st) }
+        phase = phaseFor(st)
+    }
+
+    private fun isTransient(e: Throwable) =
+        e is IOException || (e is GitHubException && e.isTransient)
+
+    /**
+     * الانتظار بعد خطأ مؤقت: إن كان السبب انقطاع الإنترنت ننتظر عودته، وإن كان ضغطاً على GitHub
+     * ننتظر مدة متزايدة. يعود بعدها المستدعي ليكمل من نفس النقطة.
+     */
+    private suspend fun pauseAndWait(e: Exception, fails: Int) {
+        val offline = e is IOException
+        val from = if (phase == Phase.PAUSED) pausedFrom else phase
+        val where = session?.stage?.label ?: ""
+        pausedFrom = from; phase = Phase.PAUSED
+        if (fails == 1) {
+            log(LogLevel.WARN, if (offline) "انقطع الاتصال أثناء «$where» — سأنتظر عودة الإنترنت وأكمل من نفس النقطة" else "GitHub مشغول مؤقتاً أثناء «$where» — إعادة المحاولة تلقائياً")
+        }
+        status(if (offline) "انقطع الإنترنت — سيُستأنف تلقائياً من «$where»" else "GitHub مشغول — إعادة المحاولة تلقائياً…")
+        if (offline) net.await()
+        delay(if (offline) minOf(2000L * fails, 15_000L) else minOf(5000L * fails, 60_000L))
+        phase = from
+        status("استئناف «$where»…")
+    }
+
+    /** ينفّذ [block] ويعيد المحاولة عند الانقطاع/الأعطال المؤقتة بدل إفشال البناء. */
+    private suspend fun <T> resilient(block: suspend () -> T): T {
+        var fails = 0
+        while (true) {
             try {
-                phase = Phase.UPLOADING
-                status("تجهيز المستودع…")
-                val br = branch.ifBlank { api.defaultBranch(repo).also { branch = it } }
-                fun runsSafe(): List<GhRun> = runCatching { api.runs(repo, wfId) }.getOrDefault(emptyList())
-
-                // 1) التعرف على المشروع (من الـ zip المختار أو من المستودع نفسه)
-                val upload = LinkedHashMap<String, ByteArray>()
-                val info: ProjectInfo
-                val prefix: String
-                val uri = projectUri
-                if (uri != null) {
-                    status("قراءة ملف المشروع…")
-                    val files = readProjectZip(uri)
-                    info = ProjectDetector.detect(files.keys) { files[it]?.toString(Charsets.UTF_8) }
-                        ?: error("لم أتعرف على نوع المشروع — تأكد أن الـ zip يحتوي مشروعاً كاملاً")
-                    prefix = ProjectDetector.UPLOAD_DIR
-                    files.forEach { (path, data) -> upload["$prefix/$path"] = data }
-                } else {
-                    status("فحص المشروع داخل المستودع…")
-                    val paths = api.tree(repo, br)
-                    info = ProjectDetector.detect(paths) { api.readText(repo, it, br) }
-                        ?: error("لم أتعرف على مشروع داخل المستودع $repo — اختر ملف zip للمشروع")
-                    prefix = ""
-                }
-                log(LogLevel.OK, "تم التعرف على المشروع: ${info.summary}")
-
-                // 2) توليد ملف البناء ورفع كل شيء في commit واحد
-                val appName = (projectName ?: repo.substringAfter('/')).removeSuffix(".zip")
-                upload[ProjectDetector.WORKFLOW_PATH] = ProjectDetector.workflow(info, prefix, appName).toByteArray(Charsets.UTF_8)
-                status("رفع ${upload.size} ملف إلى $repo…")
-                log(LogLevel.INFO, "رفع ${upload.size} ملف (يشمل ملف البناء المولَّد تلقائياً)")
-                val sha = api.commitFiles(
-                    repo, br, upload, "ApkBuilder: build ${info.type.label}",
-                    replaceDir = if (uri != null) prefix else null, onProgress = { status(it) }
-                )
-                log(LogLevel.OK, "تم الرفع — commit ${sha.take(7)}")
-
-                // 3) انتظار ظهور الـ workflow الجديد في GitHub
-                status("تفعيل ملف البناء…")
-                var tries = 0
-                while (wfId == 0L && tries < 10) {
-                    tries++
-                    val match = runCatching { api.workflows(repo) }.getOrDefault(emptyList())
-                        .firstOrNull { it.path == ProjectDetector.WORKFLOW_PATH }
-                    if (match != null) { wfId = match.id; settings.setWorkflow(match.id, match.name) } else delay(3000)
-                }
-                if (wfId == 0L) error("لم يظهر الـ workflow على GitHub — تأكد أن التوكن يملك صلاحية workflow وأن Actions مفعّل في المستودع")
-
-                // 4) تشغيل البناء
-                phase = Phase.QUEUED
-                status("بانتظار بدء البناء على GitHub…")
-                val before = runsSafe().maxOfOrNull { it.id } ?: 0L
-                var dispatched = false
-                var attempt = 0
-                while (!dispatched) {
-                    attempt++
-                    try {
-                        api.dispatch(repo, wfId, br); dispatched = true
-                    } catch (e: GitHubException) {
-                        // ربما وصل الطلب فعلاً رغم الخطأ (انقطاع) — نتأكد حتى لا يُشغَّل البناء مرتين
-                        if (runsSafe().any { it.id > before }) { dispatched = true; continue }
-                        if (attempt >= 6 || e.code == 401) throw e
-                        delay(4000)
-                    }
-                }
-                var run: GhRun? = null
-                repeat(20) { if (run == null) { delay(3000); run = runsSafe().firstOrNull { it.id > before } } }
-                val started = run ?: error("لم يبدأ أي تشغيل على GitHub — تحقق من تبويب Actions في المستودع")
-                runId = started.id
-                runUrl = started.htmlUrl
-                log(LogLevel.OK, "بدأ التشغيل #${started.runNumber} — ${started.htmlUrl}")
-
-                // 3) متابعة التنفيذ
-                var current = started
-                var pollFails = 0
-                while (current.status != "completed") {
-                    if (current.status == "in_progress") {
-                        phase = Phase.BUILDING
-                        status(runCatching { api.currentStep(repo, runId) }.getOrNull()?.let { "الخطوة: $it" } ?: "جارٍ البناء…")
-                    } else {
-                        phase = Phase.QUEUED
-                        status("في الطابور…")
-                    }
-                    delay(5000)
-                    try {
-                        current = api.run(repo, runId); pollFails = 0
-                    } catch (e: GitHubException) {
-                        // انقطاع مؤقت أثناء المتابعة لا يُفشل البناء — نكمل المحاولة
-                        if (e.code == 401 || ++pollFails >= 8) throw e
-                        status("مشكلة اتصال مؤقتة — إعادة المحاولة…")
-                    }
-                }
-
-                // 4) السجل
-                phase = Phase.DOWNLOADING
-                status("تنزيل السجل…")
-                val success = current.conclusion == "success"
-                downloadLogs(api, repo, runId, parseErrors = !success)
-
-                if (success) {
-                    status("تنزيل ملف APK…")
-                    var apks = downloadApks(api, repo, runId)
-                    var waits = 0
-                    while (apks.isEmpty() && waits < 4) { waits++; delay(3000); apks = downloadApks(api, repo, runId) }
-                    if (apks.isEmpty()) {
-                        log(LogLevel.WARN, "اكتمل البناء لكن لا يوجد APK ضمن الـ artifacts. تأكد أن الـ workflow يستخدم actions/upload-artifact.")
-                        finish(Phase.SUCCESS, "اكتمل البناء (لا يوجد APK ناتج)")
-                    } else {
-                        val saved = apks.mapIndexed { i, f -> save(f, i) }.filterNotNull()
-                        withContext(Dispatchers.Main) { savedApks = saved }
-                        finish(Phase.SUCCESS, "تم البناء بنجاح ✓")
-                    }
-                } else {
-                    if (errors.isEmpty()) {
-                        errors.add(BuildError("فشل البناء (${current.conclusion ?: "بدون نتيجة"}) — راجع السجل الكامل", null, null, null, "GitHub Actions"))
-                    }
-                    finish(Phase.FAILED, "فشل البناء")
-                }
+                return block().also { if (fails > 0) log(LogLevel.OK, "عاد الاتصال — تم الاستئناف") }
             } catch (e: CancellationException) {
-                if (runId != 0L) withContext(NonCancellable) { api.cancel(repo, runId) }
-                finish(Phase.CANCELLED, "أُلغي البناء")
                 throw e
             } catch (e: Exception) {
-                errors.add(BuildError(e.message ?: e.javaClass.simpleName, null, null, null, "ApkBuilder"))
-                log(LogLevel.ERROR, e.message ?: e.javaClass.simpleName)
-                finish(Phase.FAILED, "تعذر إكمال البناء")
+                if (!isTransient(e)) throw e
+                fails++
+                // الاتصال سليم لكن الفشل يتكرر → ليس انقطاعاً، نكفّ عن الانتظار
+                if (net.isOnline() && fails >= (if (e is IOException) 12 else 30)) throw e
+                pauseAndWait(e, fails)
             }
         }
     }
 
-    fun cancel() { job?.cancel() }
+    /** بناء جديد من البداية. */
+    fun start() {
+        val s = settings
+        if (isRunning || detecting || s.token.isBlank() || s.repo.isBlank()) return
+        discardSession()
+        logs.clear(); errors.clear(); askQueue.clear(); targetNames.clear()
+        savedApks = emptyList(); runUrl = null
+        startedAt = System.currentTimeMillis()
+        userCancelled = false
+        phase = Phase.UPLOADING
+        status("تجهيز المستودع…")
+        val repo = s.repo
+        val api = GitHubApi(s.token)
+
+        job = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val br = branch.ifBlank { resilient { api.defaultBranch(repo) }.also { branch = it } }
+                // نسخة خاصة من الـ zip: تبقى صالحة للاستئناف حتى لو أُغلق التطبيق أو سُحب إذن الملف
+                val uri = projectUri
+                var zipPath: String? = null
+                if (uri != null) {
+                    status("نسخ ملف المشروع…")
+                    sessionZip.parentFile?.mkdirs()
+                    app.contentResolver.openInputStream(uri)?.use { i -> sessionZip.outputStream().use { o -> i.copyTo(o) } }
+                        ?: error("تعذر قراءة الملف")
+                    zipPath = sessionZip.absolutePath
+                }
+                val appName = (projectName ?: repo.substringAfter('/')).removeSuffix(".zip")
+                session = BuildSession(repo, br, Stage.UPLOAD, appName, startedAt, projectZip = zipPath)
+                store.save(session!!)
+                runStages(api)
+            } catch (e: CancellationException) {
+                onCancelled(api)
+                throw e
+            } catch (e: Exception) {
+                onFailed(e)
+            }
+        }
+    }
+
+    /** يكمل بناءً محفوظاً من آخر مرحلة وصل لها (يُستدعى تلقائياً أو بزر «استئناف»). */
+    fun resume() {
+        val saved = resumable ?: store.load() ?: return
+        if (isRunning || settings.token.isBlank()) return
+        session = saved
+        resumable = null
+        userCancelled = false
+        errors.clear(); askQueue.clear(); targetNames.clear(); savedApks = emptyList()
+        startedAt = saved.startedAt
+        runUrl = saved.runUrl
+        branch = saved.branch
+        pausedFrom = phaseFor(saved.stage)
+        phase = Phase.PAUSED
+        log(LogLevel.INFO, "استئناف البناء من مرحلة «${saved.stage.label}»" + if (saved.runId != 0L) " (التشغيل على GitHub لم يتوقف)" else "")
+        status("استئناف من «${saved.stage.label}»…")
+        val api = GitHubApi(settings.token)
+
+        job = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                net.await()
+                phase = pausedFrom
+                runStages(api)
+            } catch (e: CancellationException) {
+                onCancelled(api)
+                throw e
+            } catch (e: Exception) {
+                onFailed(e)
+            }
+        }
+    }
+
+    fun cancel() { userCancelled = true; job?.cancel() }
+
+    private suspend fun onCancelled(api: GitHubApi) {
+        val s = session
+        if (userCancelled) {
+            // المستخدم ضغط «إيقاف»: نلغي التشغيل على GitHub وننهي الجلسة
+            if (s != null && s.runId != 0L) withContext(NonCancellable) { api.cancel(s.repo, s.runId) }
+            withContext(NonCancellable) { discardSession(s) }
+            finish(Phase.CANCELLED, "أُلغي البناء")
+        } else {
+            // أُغلق التطبيق/الشاشة: نبقي الجلسة محفوظة ليكمل البناء عند الفتح
+            resumable = s
+        }
+    }
+
+    private fun onFailed(e: Exception) {
+        errors.add(BuildError(e.message ?: e.javaClass.simpleName, null, null, null, "ApkBuilder"))
+        log(LogLevel.ERROR, e.message ?: e.javaClass.simpleName)
+        val s = session
+        if (s != null && s.stage >= Stage.DISPATCH) {
+            // فشل بعد أن بدأ البناء على GitHub: نحتفظ بالتقدم ليمكن استئنافه بدل البدء من الصفر
+            resumable = s
+            finish(Phase.FAILED, "توقف عند «${s.stage.label}» — يمكنك الاستئناف")
+        } else {
+            discardSession(s)
+            finish(Phase.FAILED, "تعذر إكمال البناء")
+        }
+    }
+
+    /** يمر على المراحل بالترتيب؛ كل مرحلة تحفظ تقدمها فيستأنف من حيث توقف. تنتهي عندما تُمسح الجلسة. */
+    private suspend fun runStages(api: GitHubApi) {
+        while (true) {
+            val s = session ?: return
+            when (s.stage) {
+                Stage.UPLOAD -> stageUpload(api)
+                Stage.WAIT_WORKFLOW -> stageWaitWorkflow(api)
+                Stage.DISPATCH -> stageDispatch(api)
+                Stage.FIND_RUN -> stageFindRun(api)
+                Stage.POLL -> stagePoll(api)
+                Stage.LOGS -> stageLogs(api)
+                Stage.APK -> stageApk(api)
+                Stage.DONE -> return
+            }
+        }
+    }
+
+    private suspend fun stageUpload(api: GitHubApi) {
+        val s = session!!
+        phase = Phase.UPLOADING
+        status("فحص المشروع…")
+        val upload = LinkedHashMap<String, ByteArray>()
+        val info: ProjectInfo
+        val prefix: String
+        if (s.projectZip != null) {
+            val files = File(s.projectZip).inputStream().use { ProjectDetector.readZip(it) }
+            info = ProjectDetector.detect(files.keys) { files[it]?.toString(Charsets.UTF_8) }
+                ?: error("لم أتعرف على نوع المشروع — تأكد أن الـ zip يحتوي مشروعاً كاملاً")
+            prefix = ProjectDetector.UPLOAD_DIR
+            files.forEach { (path, data) -> upload["$prefix/$path"] = data }
+        } else {
+            val paths = resilient { api.tree(s.repo, s.branch) }
+            info = resilient { ProjectDetector.detect(paths) { api.readText(s.repo, it, s.branch) } }
+                ?: error("لم أتعرف على مشروع داخل المستودع ${s.repo} — اختر ملف zip للمشروع")
+            prefix = ""
+        }
+        if (s.infoLabel.isBlank()) log(LogLevel.OK, "تم التعرف على المشروع: ${info.summary}")
+        patch { copy(infoLabel = info.summary) }
+
+        upload[ProjectDetector.WORKFLOW_PATH] = ProjectDetector.workflow(info, prefix, s.appName).toByteArray(Charsets.UTF_8)
+        status("رفع ${upload.size} ملف إلى ${s.repo}…")
+        if (s.upload == null) log(LogLevel.INFO, "رفع ${upload.size} ملف (يشمل ملف البناء المولَّد تلقائياً)")
+        val sha = resilient {
+            api.commitFiles(
+                s.repo, s.branch, upload, "ApkBuilder: build ${info.type.label}",
+                replaceDir = if (s.projectZip != null) prefix else null,
+                onProgress = { status(it) },
+                resume = session?.upload,
+                onCheckpoint = { cp -> patch { copy(upload = cp) } }
+            )
+        }
+        patch { copy(commitSha = sha, upload = null) }
+        runCatching { sessionZip.delete() }
+        log(LogLevel.OK, "تم الرفع — commit ${sha.take(7)}")
+        setStage(Stage.WAIT_WORKFLOW)
+    }
+
+    private suspend fun stageWaitWorkflow(api: GitHubApi) {
+        val s = session!!
+        phase = Phase.UPLOADING
+        status("تفعيل ملف البناء…")
+        var wfId = 0L
+        var tries = 0
+        while (wfId == 0L && tries < 10) {
+            tries++
+            val match = resilient { api.workflows(s.repo) }.firstOrNull { it.path == ProjectDetector.WORKFLOW_PATH }
+            if (match != null) { wfId = match.id; settings.setWorkflow(match.id, match.name) } else delay(3000)
+        }
+        if (wfId == 0L) error("لم يظهر الـ workflow على GitHub — تأكد أن التوكن يملك صلاحية workflow وأن Actions مفعّل في المستودع")
+        patch { copy(wfId = wfId) }
+        setStage(Stage.DISPATCH)
+    }
+
+    private suspend fun stageDispatch(api: GitHubApi) {
+        val s = session!!
+        phase = Phase.QUEUED
+        status("بانتظار بدء البناء على GitHub…")
+        if (s.runsBefore < 0) {
+            val before = resilient { api.runs(s.repo, s.wfId) }.maxOfOrNull { it.id } ?: 0L
+            patch { copy(runsBefore = before) }
+        }
+        val before = session!!.runsBefore
+        var attempt = 0
+        var maybeSent = false
+        var pauses = 0
+        while (true) {
+            // ربما وصل طلب التشغيل فعلاً (قبل الانقطاع) — نتأكد حتى لا يُشغَّل البناء مرتين
+            if (maybeSent) delay(6000)
+            if (resilient { api.runs(s.repo, s.wfId) }.any { it.id > before }) break
+            try {
+                api.dispatch(s.repo, s.wfId, s.branch)
+                break
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (e is GitHubException && e.code == 422 && ++attempt < 6) { delay(4000); continue }
+                if (e is GitHubException && e.code == 401) throw e
+                if (!isTransient(e)) throw e
+                maybeSent = true
+                pauseAndWait(e, ++pauses)
+            }
+        }
+        setStage(Stage.FIND_RUN)
+    }
+
+    private suspend fun stageFindRun(api: GitHubApi) {
+        val s = session!!
+        phase = Phase.QUEUED
+        var run: GhRun? = null
+        repeat(20) { if (run == null) { delay(3000); run = resilient { api.runs(s.repo, s.wfId) }.firstOrNull { it.id > s.runsBefore } } }
+        val started = run ?: error("لم يبدأ أي تشغيل على GitHub — تحقق من تبويب Actions في المستودع")
+        patch { copy(runId = started.id, runUrl = started.htmlUrl) }
+        runUrl = started.htmlUrl
+        log(LogLevel.OK, "بدأ التشغيل #${started.runNumber} — ${started.htmlUrl}")
+        setStage(Stage.POLL)
+    }
+
+    private suspend fun stagePoll(api: GitHubApi) {
+        val s = session!!
+        var current = resilient { api.run(s.repo, s.runId) }
+        while (current.status != "completed") {
+            if (current.status == "in_progress") {
+                phase = Phase.BUILDING
+                status(runCatching { api.currentStep(s.repo, s.runId) }.getOrNull()?.let { "الخطوة: $it" } ?: "جارٍ البناء…")
+            } else {
+                phase = Phase.QUEUED
+                status("في الطابور…")
+            }
+            delay(5000)
+            current = resilient { api.run(s.repo, s.runId) }
+        }
+        patch { copy(conclusion = current.conclusion ?: "none") }
+        setStage(Stage.LOGS)
+    }
+
+    private suspend fun stageLogs(api: GitHubApi) {
+        val s = session!!
+        phase = Phase.DOWNLOADING
+        status("تنزيل السجل…")
+        val success = s.conclusion == "success"
+        resilient { downloadLogs(api, s.repo, s.runId, parseErrors = !success) }
+        if (success) {
+            setStage(Stage.APK)
+        } else {
+            if (errors.isEmpty()) {
+                errors.add(BuildError("فشل البناء (${s.conclusion?.takeIf { it != "none" } ?: "بدون نتيجة"}) — راجع السجل الكامل", null, null, null, "GitHub Actions"))
+            }
+            discardSession(s)
+            finish(Phase.FAILED, "فشل البناء")
+        }
+    }
+
+    private suspend fun stageApk(api: GitHubApi) {
+        val s = session!!
+        phase = Phase.DOWNLOADING
+        status("تنزيل ملف APK…")
+        var apks = resilient { downloadApks(api, s.repo, s.runId) }
+        var waits = 0
+        while (apks.isEmpty() && waits < 4) { waits++; delay(3000); apks = resilient { downloadApks(api, s.repo, s.runId) } }
+        if (apks.isEmpty()) {
+            log(LogLevel.WARN, "اكتمل البناء لكن لا يوجد APK ضمن الـ artifacts. تأكد أن الـ workflow يستخدم actions/upload-artifact.")
+            discardSession(s)
+            finish(Phase.SUCCESS, "اكتمل البناء (لا يوجد APK ناتج)")
+        } else {
+            val saved = apks.mapIndexed { i, f -> save(f, i) }.filterNotNull()
+            withContext(Dispatchers.Main) { savedApks = saved }
+            discardSession(s)
+            finish(Phase.SUCCESS, "تم البناء بنجاح ✓")
+        }
+    }
 
     private fun finish(p: Phase, text: String) { phase = p; statusText = text }
 
@@ -360,10 +579,11 @@ class BuildViewModel(private val app: Application) : AndroidViewModel(app) {
     private val timestamp = Regex("^\\uFEFF?\\d{4}-\\d{2}-\\d{2}T[\\d:.]+Z ")
 
     private fun downloadLogs(api: GitHubApi, repo: String, runId: Long, parseErrors: Boolean) {
-        val zip = File(app.cacheDir, "run_logs.zip")
+        val zip = File(app.cacheDir, "run_logs_$runId.zip")
         try {
             api.downloadLogs(repo, runId, zip)
         } catch (e: Exception) {
+            if (isTransient(e)) throw e   // انقطاع: نُبقي الجزء المنزَّل ونكمل بعد عودة الإنترنت
             log(LogLevel.WARN, "تعذر تنزيل السجل: ${e.message}")
             return
         }
@@ -413,17 +633,23 @@ class BuildViewModel(private val app: Application) : AndroidViewModel(app) {
         val result = ArrayList<File>()
         for (art in api.artifacts(repo, runId).filter { !it.expired }) {
             val zip = File(app.cacheDir, "artifact_${art.id}.zip")
-            api.downloadArtifact(repo, art.id, zip)
-            ZipInputStream(zip.inputStream().buffered()).use { z ->
-                var e = z.nextEntry
-                while (e != null) {
-                    if (!e.isDirectory && e.name.endsWith(".apk", true)) {
-                        val f = File(outDir, e.name.substringAfterLast('/'))
-                        f.outputStream().use { z.copyTo(it) }
-                        result.add(f)
+            // ما اكتمل تنزيله سابقاً يُستخدم كما هو، والجزئي يُكمَل من حيث توقف (Range)
+            if (!zip.exists()) api.downloadArtifact(repo, art.id, zip)
+            try {
+                ZipInputStream(zip.inputStream().buffered()).use { z ->
+                    var e = z.nextEntry
+                    while (e != null) {
+                        if (!e.isDirectory && e.name.endsWith(".apk", true)) {
+                            val f = File(outDir, e.name.substringAfterLast('/'))
+                            f.outputStream().use { z.copyTo(it) }
+                            result.add(f)
+                        }
+                        e = z.nextEntry
                     }
-                    e = z.nextEntry
                 }
+            } catch (e: IOException) {
+                zip.delete()   // ملف تالف → التنزيل التالي يبدأ نظيفاً
+                throw e
             }
             zip.delete()
         }
